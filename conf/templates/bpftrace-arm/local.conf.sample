@@ -1,0 +1,3 @@
+MACHINE ??= "raspberrypi4"
+DISTRO ?= "poky"
+DISABLE_STATIC = ""
