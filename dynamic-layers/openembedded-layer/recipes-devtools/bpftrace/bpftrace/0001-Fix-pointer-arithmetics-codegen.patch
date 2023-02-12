@@ -1,0 +1,39 @@
+From 2f1a41ffd48b45e1567353856105070ebbd8395d Mon Sep 17 00:00:00 2001
+From: Viktor Malik <viktor.malik@gmail.com>
+Date: Tue, 25 Oct 2022 09:42:57 +0200
+Subject: [PATCH] Fix pointer arithmetics codegen
+
+Codegen for (ptr + X) creates the following instructions:
+
+  %0 = mul sizeof(*ptr), X
+  %1 = add ptr, %0
+
+If X is not a 64-bit int, the 'mul' will have incompatible operands
+which will cause a segfault in LLVM (at least in LLVM 14).
+
+This fixes the problem by extending X to 64 bits, if necessary.
+---
+ src/ast/passes/codegen_llvm.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/ast/passes/codegen_llvm.cpp b/src/ast/passes/codegen_llvm.cpp
+index 6d59af8f..593b9cf1 100644
+--- a/src/ast/passes/codegen_llvm.cpp
++++ b/src/ast/passes/codegen_llvm.cpp
+@@ -1498,10 +1498,14 @@ void CodegenLLVM::binop_ptr(Binop &binop)
+   {
+     // Cannot use GEP here as LLVM doesn't know its a pointer
+     bool leftptr = binop.left->type.IsPtrTy();
+-    auto &ptr = leftptr ? binop.left->type : binop.right->type;
++    auto &ptr_ty = leftptr ? binop.left->type : binop.right->type;
++    auto &other_ty = leftptr ? binop.right->type : binop.left->type;
+     Value *ptr_expr = leftptr ? lhs : rhs;
+     Value *other_expr = leftptr ? rhs : lhs;
+-    auto elem_size = b_.getInt64(ptr.GetPointeeTy()->GetSize());
++
++    if (other_ty.IsIntTy() && other_ty.GetSize() != 8)
++      other_expr = b_.CreateZExt(other_expr, b_.getInt64Ty());
++    auto elem_size = b_.getInt64(ptr_ty.GetPointeeTy()->GetSize());
+     expr_ = b_.CreateMul(elem_size, other_expr);
+     if (binop.op == Operator::PLUS)
+       expr_ = b_.CreateAdd(ptr_expr, expr_);

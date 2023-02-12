@@ -1,0 +1,125 @@
+From 433af1f6acc8f2278126f3d62991a0edab2de1c7 Mon Sep 17 00:00:00 2001
+From: Tomislav Novak <tnovak@fb.com>
+Date: Fri, 7 Oct 2022 13:13:44 -0700
+Subject: Fix offset calculation for register reads
+
+Unconditionally using i64 as the GEP type when indexing into pt_regs gives
+incorrect results on 32-bit architectures such as armv7. For example, reg("r1")
+emits the following IR, reading the value at offset 8 (r2) in pt_regs rather
+than 4:
+
+  %4 = bitcast i8* %0 to i64*
+  %5 = getelementptr i64, i64* %4, i64 1
+  %reg_r1 = load volatile i64, i64* %5, align 8
+
+Modify CreateRegisterRead to use the load offset/size that depends on the
+target architecture.
+---
+ src/ast/irbuilderbpf.cpp        | 23 +++++++++++++++++++----
+ src/ast/irbuilderbpf.h          |  1 +
+ src/ast/passes/codegen_llvm.cpp | 23 +++++------------------
+ 3 files changed, 25 insertions(+), 22 deletions(-)
+
+diff --git a/src/ast/irbuilderbpf.cpp b/src/ast/irbuilderbpf.cpp
+index 6006e0f4..2fb94c92 100644
+--- a/src/ast/irbuilderbpf.cpp
++++ b/src/ast/irbuilderbpf.cpp
+@@ -1162,16 +1162,31 @@ Value *IRBuilderBPF::CreateRegisterRead(Value *ctx, const std::string &builtin)
+   else // argX
+     offset = arch::arg_offset(atoi(builtin.substr(3).c_str()));
+ 
+-  Value *ctx_ptr = CreatePointerCast(ctx, getInt64Ty()->getPointerTo());
++  return CreateRegisterRead(ctx, offset, builtin);
++}
++
++Value *IRBuilderBPF::CreateRegisterRead(Value *ctx,
++                                        int offset,
++                                        const std::string &name)
++{
++  // Bitwidth of register values in struct pt_regs is the same as the kernel
++  // pointer width on all supported architectures.
++  llvm::Type *registerTy = getKernelPointerStorageTy();
++  Value *ctx_ptr = CreatePointerCast(ctx, registerTy->getPointerTo());
+   // LLVM optimization is possible to transform `(uint64*)ctx` into
+   // `(uint8*)ctx`, but sometimes this causes invalid context access.
+   // Mark every context access to suppress any LLVM optimization.
+-  Value *result = CreateLoad(getInt64Ty(),
+-                             CreateGEP(getInt64Ty(), ctx_ptr, getInt64(offset)),
+-                             builtin);
++  Value *result = CreateLoad(registerTy,
++                             CreateGEP(registerTy, ctx_ptr, getInt64(offset)),
++                             name);
+   // LLVM 7.0 <= does not have CreateLoad(*Ty, *Ptr, isVolatile, Name),
+   // so call setVolatile() manually
+   dyn_cast<LoadInst>(result)->setVolatile(true);
++  // Caller expects an int64, so add a cast if the register size is different.
++  if (result->getType()->getIntegerBitWidth() != 64)
++  {
++    result = CreateIntCast(result, getInt64Ty(), false);
++  }
+   return result;
+ }
+ 
+diff --git a/src/ast/irbuilderbpf.h b/src/ast/irbuilderbpf.h
+index da77d966..3f06e9d3 100644
+--- a/src/ast/irbuilderbpf.h
++++ b/src/ast/irbuilderbpf.h
+@@ -148,6 +148,7 @@ public:
+   StructType *GetStructType(std::string name, const std::vector<llvm::Type *> & elements, bool packed = false);
+   AllocaInst *CreateUSym(llvm::Value *val, const location &loc);
+   Value *CreateRegisterRead(Value *ctx, const std::string &builtin);
++  Value *CreateRegisterRead(Value *ctx, int offset, const std::string &name);
+   Value      *CreatKFuncArg(Value *ctx, SizedType& type, std::string& name);
+   CallInst *CreateSkbOutput(Value *skb,
+                             Value *len,
+diff --git a/src/ast/passes/codegen_llvm.cpp b/src/ast/passes/codegen_llvm.cpp
+index 6457a193..8ed02d04 100644
+--- a/src/ast/passes/codegen_llvm.cpp
++++ b/src/ast/passes/codegen_llvm.cpp
+@@ -269,12 +269,7 @@ void CodegenLLVM::visit(Builtin &builtin)
+     }
+ 
+     int arg_num = atoi(builtin.ident.substr(4).c_str());
+-    Value *ctx = b_.CreatePointerCast(ctx_, b_.getInt64Ty()->getPointerTo());
+-    Value *sp = b_.CreateLoad(
+-        b_.getInt64Ty(),
+-        b_.CreateGEP(b_.getInt64Ty(), ctx, b_.getInt64(sp_offset)),
+-        "reg_sp");
+-    dyn_cast<LoadInst>(sp)->setVolatile(true);
++    Value *sp = b_.CreateRegisterRead(ctx_, sp_offset, "reg_sp");
+     AllocaInst *dst = b_.CreateAllocaBPF(builtin.type, builtin.ident);
+     Value *src = b_.CreateAdd(sp,
+                               b_.getInt64((arg_num + arch::arg_stack_offset()) *
+@@ -879,12 +874,7 @@ void CodegenLLVM::visit(Call &call)
+       LOG(FATAL) << "negative offset on reg() call";
+     }
+ 
+-    Value *ctx = b_.CreatePointerCast(ctx_, b_.getInt64Ty()->getPointerTo());
+-    expr_ = b_.CreateLoad(
+-        b_.getInt64Ty(),
+-        b_.CreateGEP(b_.getInt64Ty(), ctx, b_.getInt64(offset)),
+-        call.func + "_" + reg_name);
+-    dyn_cast<LoadInst>(expr_)->setVolatile(true);
++    expr_ = b_.CreateRegisterRead(ctx_, offset, call.func + "_" + reg_name);
+   }
+   else if (call.func == "printf")
+   {
+@@ -3087,12 +3077,9 @@ void CodegenLLVM::generateWatchpointSetupProbe(
+   // Pull out function argument
+   Value *ctx = func->arg_begin();
+   int offset = arch::arg_offset(arg_num);
+-  Value *arg = b_.CreateGEP(b_.getInt8Ty(),
+-                            ctx,
+-                            b_.getInt64(offset * sizeof(uintptr_t)));
+-  Value *addr = b_.CreateLoad(b_.getInt64Ty(),
+-                              arg,
+-                              "arg" + std::to_string(arg_num));
++  Value *addr = b_.CreateRegisterRead(ctx,
++                                      offset,
++                                      "arg" + std::to_string(arg_num));
+ 
+   // Tell userspace to setup the real watchpoint
+   auto elements = AsyncEvent::Watchpoint().asLLVMType(b_);
+-- 
+cgit v1.2.3-18-g5258
+

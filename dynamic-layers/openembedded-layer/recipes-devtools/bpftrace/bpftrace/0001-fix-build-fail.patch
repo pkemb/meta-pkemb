@@ -1,0 +1,23 @@
+From 932a5dc793e76b4fcdb33cba1349b434f394eb8b Mon Sep 17 00:00:00 2001
+From: pkemb <pkemb@outlook.com>
+Date: Sat, 11 Feb 2023 15:50:34 +0800
+Subject: [PATCH] fix build fail
+
+Signed-off-by: pkemb <pkemb@outlook.com>
+---
+ src/bpftrace.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/bpftrace.cpp b/src/bpftrace.cpp
+index 2ef1388d..dfc01b45 100644
+--- a/src/bpftrace.cpp
++++ b/src/bpftrace.cpp
+@@ -1256,7 +1256,7 @@ int BPFtrace::run(BpfBytecode bytecode)
+   finalize_ = false;
+   exitsig_recv = false;
+ 
+-  if (run_special_probe("END_trigger", bytecode_, END_trigger))
++  if (run_special_probe("END_trigger", bytecode_, (void(*)())END_trigger))
+     return -1;
+ 
+   poll_perf_events(/* drain */ true);

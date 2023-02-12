@@ -1,0 +1,134 @@
+From ad5eca5fbd33d8ba329043d582b1bc41e625a5e9 Mon Sep 17 00:00:00 2001
+From: Tomislav Novak <tnovak@fb.com>
+Date: Fri, 7 Oct 2022 13:07:20 -0700
+Subject: Add helper methods to obtain pointer width of traced code
+
+Codegen currently assumes that pointers and register are always 64-bit wide,
+which on 32-bit systems results in incorrectly-sized and possibly misaligned
+loads. In the example below, codegen emits an 8-byte load of the char* field
+located at ctx offset 12, which fails BPF verification (offset % size != 0):
+
+  # bpftrace -ve 't:syscalls:sys_enter_open { printf("%p\n", args->filename); }'
+  0: (b7) r2 = 0
+  1: (7b) *(u64 *)(r10 -16) = r2
+  2: (79) r2 = *(u64 *)(r1 +12)
+  invalid bpf_context access off=12 size=8
+
+In preparation of removing the hardcoded pointer size, this commit adds a few
+methods that return the suitable integer types for representing registers and
+pointers of a given AddrSpace.
+
+Due to a potential bitness mismatch between bpftrace, the kernel and the uprobed
+process, we derive the (kernel) pointer width from utsname.machine. Currently
+user pointers are assumed to have the same width, but the code is written in
+a way that makes this easy to change later.
+---
+ CHANGELOG.md             |  2 ++
+ src/ast/irbuilderbpf.cpp | 25 +++++++++++++++++++++++++
+ src/ast/irbuilderbpf.h   |  6 ++++++
+ src/utils.cpp            | 19 +++++++++++++++++++
+ src/utils.h              |  3 +++
+ 5 files changed, 55 insertions(+)
+
+diff --git a/src/ast/irbuilderbpf.cpp b/src/ast/irbuilderbpf.cpp
+index 00f0f172..6006e0f4 100644
+--- a/src/ast/irbuilderbpf.cpp
++++ b/src/ast/irbuilderbpf.cpp
+@@ -1340,5 +1340,30 @@ StoreInst *IRBuilderBPF::createAlignedStore(Value *val,
+ #endif
+ }
+
++llvm::Type *IRBuilderBPF::getPointerStorageTy(AddrSpace as)
++{
++  switch (as)
++  {
++    case AddrSpace::user:
++      return getUserPointerStorageTy();
++    default:
++      return getKernelPointerStorageTy();
++  }
++}
++
++llvm::Type *IRBuilderBPF::getKernelPointerStorageTy()
++{
++  static int ptr_width = get_kernel_ptr_width();
++
++  return getIntNTy(ptr_width);
++}
++
++llvm::Type *IRBuilderBPF::getUserPointerStorageTy()
++{
++  // TODO: we don't currently have an easy way of determining the pointer size
++  // of the uprobed process, so assume it's the same as the kernel's for now.
++  return getKernelPointerStorageTy();
++}
++
+ } // namespace ast
+ } // namespace bpftrace
+diff --git a/src/ast/irbuilderbpf.h b/src/ast/irbuilderbpf.h
+index e124911b..da77d966 100644
+--- a/src/ast/irbuilderbpf.h
++++ b/src/ast/irbuilderbpf.h
+@@ -175,6 +175,9 @@ public:
+   void hoist(const std::function<void()> &functor);
+   int helper_error_id_ = 0;
+
++  // Returns the integer type used to represent pointers in traced code.
++  llvm::Type *getPointerStorageTy(AddrSpace as);
++
+ private:
+   Module &module_;
+   BPFtrace &bpftrace_;
+@@ -190,6 +193,9 @@ private:
+                                  AddrSpace as);
+   libbpf::bpf_func_id selectProbeReadHelper(AddrSpace as, bool str);
+
++  llvm::Type *getKernelPointerStorageTy();
++  llvm::Type *getUserPointerStorageTy();
++
+   std::map<std::string, StructType *> structs_;
+ };
+
+diff --git a/src/utils.cpp b/src/utils.cpp
+index f54c99e5..46ffc1e2 100644
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -1191,4 +1191,23 @@ std::string strip_symbol_module(const std::string &symbol)
+   return idx != std::string::npos ? symbol.substr(0, idx) : symbol;
+ }
+
++int get_kernel_ptr_width()
++{
++  // We can't assume that sizeof(void*) in bpftrace is the same as the kernel
++  // pointer size (bpftrace can be compiled as a 32-bit binary and run on a
++  // 64-bit kernel), so we guess based on the machine field of struct utsname.
++  // Note that the uname() syscall can return different values for compat mode
++  // processes (e.g. "armv8l" instead of "aarch64"; see COMPAT_UTS_MACHINE), so
++  // make sure this is taken into account.
++  struct utsname utsname;
++  if (uname(&utsname) != 0)
++    LOG(FATAL) << "uname failed: " << strerror(errno);
++
++  const char *machine = utsname.machine;
++  if (!strncmp(machine, "armv7", 5))
++    return 32;
++
++  return 64;
++}
++
+ } // namespace bpftrace
+diff --git a/src/utils.h b/src/utils.h
+index 9b96be9f..2083b792 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -271,4 +271,7 @@ inline void hash_combine(std::size_t &seed, const T &value)
+   seed ^= hasher(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+ }
+
++// Returns the width in bits of kernel pointers.
++int get_kernel_ptr_width();
++
+ } // namespace bpftrace
+--
+cgit v1.2.3-18-g5258
+

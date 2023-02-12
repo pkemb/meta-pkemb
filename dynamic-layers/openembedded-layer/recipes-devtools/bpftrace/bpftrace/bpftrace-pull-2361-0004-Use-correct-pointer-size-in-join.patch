@@ -1,0 +1,74 @@
+From aa89375a905f79577e325d9ca40be9257ed11a93 Mon Sep 17 00:00:00 2001
+From: Tomislav Novak <tnovak@fb.com>
+Date: Fri, 7 Oct 2022 15:29:50 -0700
+Subject: Use correct pointer size in join()
+
+Implementation of the join() builtin used 8-byte bpf_probe_read() calls to load
+char *'s, which doesn't work on 32-bit architectures. Use the correct pointer
+size and simplify by removing the first/second temporaries in favor of advancing
+expr_ directly to the next pointer.
+---
+ src/ast/passes/codegen_llvm.cpp | 26 ++++++++++++--------------
+ 1 file changed, 12 insertions(+), 14 deletions(-)
+
+diff --git a/src/ast/passes/codegen_llvm.cpp b/src/ast/passes/codegen_llvm.cpp
+index d141b7de..ff168998 100644
+--- a/src/ast/passes/codegen_llvm.cpp
++++ b/src/ast/passes/codegen_llvm.cpp
+@@ -682,10 +682,6 @@ void CodegenLLVM::visit(Call &call)
+     auto arg0 = call.vargs->front();
+     auto scoped_del = accept(arg0);
+     auto addrspace = arg0->type.GetAS();
+-    AllocaInst *first = b_.CreateAllocaBPF(b_.getInt64Ty(),
+-                                           call.func + "_first");
+-    AllocaInst *second = b_.CreateAllocaBPF(b_.getInt64Ty(),
+-                                            call.func + "_second");
+     Value *perfdata = b_.CreateGetJoinMap(ctx_, call.loc);
+     Function *parent = b_.GetInsertBlock()->getParent();
+ 
+@@ -714,8 +710,14 @@ void CodegenLLVM::visit(Call &call)
+                        b_.CreateGEP(b_.getInt8Ty(), perfdata, b_.getInt64(8)),
+                        b_.getInt64Ty()->getPointerTo()));
+     join_id_++;
++
++    SizedType elem_type = CreatePointer(CreateInt8(), addrspace);
++    size_t ptr_width = b_.getPointerStorageTy(addrspace)->getIntegerBitWidth();
++    assert(b_.GetType(elem_type) == b_.getInt64Ty());
++
++    // temporary that stores the value of arg[i]
+     AllocaInst *arr = b_.CreateAllocaBPF(b_.getInt64Ty(), call.func + "_r0");
+-    b_.CreateProbeRead(ctx_, arr, 8, expr_, addrspace, call.loc);
++    b_.CreateProbeRead(ctx_, arr, elem_type, expr_, call.loc);
+     b_.CreateProbeReadStr(
+         ctx_,
+         b_.CreateGEP(b_.getInt8Ty(), perfdata, b_.getInt64(8 + 8)),
+@@ -726,21 +728,17 @@ void CodegenLLVM::visit(Call &call)
+ 
+     for (unsigned int i = 1; i < bpftrace_.join_argnum_; i++)
+     {
+-      // argi
+-      b_.CreateStore(b_.CreateAdd(expr_, b_.getInt64(8 * i)), first);
+-      b_.CreateProbeRead(ctx_,
+-                         second,
+-                         8,
+-                         b_.CreateLoad(b_.getInt64Ty(), first),
+-                         addrspace,
+-                         call.loc);
++      // advance to the next array element
++      expr_ = b_.CreateAdd(expr_, b_.getInt64(ptr_width / 8));
++
++      b_.CreateProbeRead(ctx_, arr, elem_type, expr_, call.loc);
+       b_.CreateProbeReadStr(
+           ctx_,
+           b_.CreateGEP(b_.getInt8Ty(),
+                        perfdata,
+                        b_.getInt64(8 + 8 + i * bpftrace_.join_argsize_)),
+           bpftrace_.join_argsize_,
+-          b_.CreateLoad(b_.getInt64Ty(), second),
++          b_.CreateLoad(b_.getInt64Ty(), arr),
+           addrspace,
+           call.loc);
+     }
+-- 
+cgit v1.2.3-18-g5258
+

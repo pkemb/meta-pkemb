@@ -1,0 +1,181 @@
+From 7dd04674410c83268f11545636b31dfb6291725c Mon Sep 17 00:00:00 2001
+From: Tomislav Novak <tnovak@meta.com>
+Date: Wed, 30 Nov 2022 09:36:17 -0800
+Subject: [PATCH] Fix offset calculation for arrays of pointers on 32-bit
+ architectures
+
+When indexing into an array of pointers, or doing arithmetic on pointers
+to pointers, make sure the correct element/pointee size is used for offset
+calculation. For example, `*((int32 **)$ptr + 1)` should generate a read at
+offset 4 from `$ptr` on a 32-bit system.
+
+This is a follow-up to 02b0f077 ("Use arch-dependent size when reading pointers
+from kernel/user memory").
+---
+ src/ast/irbuilderbpf.cpp        | 11 +++++++++++
+ src/ast/irbuilderbpf.h          |  7 +++++++
+ src/ast/passes/codegen_llvm.cpp |  8 ++++----
+ tests/runtime/array             |  6 ++++++
+ tests/runtime/pointers          |  6 ++++++
+ tests/runtime/pointers.rej      | 11 +++++++++++
+ tests/testprogs/array_access.c  | 16 ++++++++++++++++
+ 7 files changed, 61 insertions(+), 4 deletions(-)
+ create mode 100644 tests/runtime/pointers.rej
+
+diff --git a/src/ast/irbuilderbpf.cpp b/src/ast/irbuilderbpf.cpp
+index 09ae1c5e..59371e88 100644
+--- a/src/ast/irbuilderbpf.cpp
++++ b/src/ast/irbuilderbpf.cpp
+@@ -1401,6 +1401,17 @@ llvm::Value *IRBuilderBPF::CreateDatastructElemLoad(
+   return CreateIntCast(expr, getInt64Ty(), false);
+ }
+ 
++llvm::Value *IRBuilderBPF::CreatePtrOffset(const SizedType &type,
++                                           llvm::Value *index,
++                                           AddrSpace as)
++{
++  size_t elem_size = type.IsPtrTy()
++                         ? getPointerStorageTy(as)->getIntegerBitWidth() / 8
++                         : type.GetSize();
++
++  return CreateMul(index, getInt64(elem_size));
++}
++
+ llvm::Type *IRBuilderBPF::getPointerStorageTy(AddrSpace as)
+ {
+   switch (as)
+diff --git a/src/ast/irbuilderbpf.h b/src/ast/irbuilderbpf.h
+index b6a06778..9f066010 100644
+--- a/src/ast/irbuilderbpf.h
++++ b/src/ast/irbuilderbpf.h
+@@ -181,6 +181,13 @@ public:
+                        Value *data_len,
+                        const location &loc);
+ 
++  // For a type T, creates an integer expression representing the byte offset
++  // of the element at the given index in T[]. Used for array dereferences and
++  // pointer arithmetic.
++  llvm::Value *CreatePtrOffset(const SizedType &type,
++                               llvm::Value *index,
++                               AddrSpace as);
++
+   StoreInst *createAlignedStore(Value *val, Value *ptr, unsigned align);
+   // moves the insertion point to the start of the function you're inside,
+   // invokes functor, then moves the insertion point back to its original
+diff --git a/src/ast/passes/codegen_llvm.cpp b/src/ast/passes/codegen_llvm.cpp
+index 593b9cf1..0e418868 100644
+--- a/src/ast/passes/codegen_llvm.cpp
++++ b/src/ast/passes/codegen_llvm.cpp
+@@ -1505,8 +1505,9 @@ void CodegenLLVM::binop_ptr(Binop &binop)
+ 
+     if (other_ty.IsIntTy() && other_ty.GetSize() != 8)
+       other_expr = b_.CreateZExt(other_expr, b_.getInt64Ty());
+-    auto elem_size = b_.getInt64(ptr_ty.GetPointeeTy()->GetSize());
+-    expr_ = b_.CreateMul(elem_size, other_expr);
++    expr_ = b_.CreatePtrOffset(*ptr_ty.GetPointeeTy(),
++                               other_expr,
++                               ptr_ty.GetAS());
+     if (binop.op == Operator::PLUS)
+       expr_ = b_.CreateAdd(ptr_expr, expr_);
+     else
+@@ -1874,7 +1875,6 @@ void CodegenLLVM::visit(ArrayAccess &arr)
+   SizedType &type = arr.expr->type;
+   auto elem_type = type.IsArrayTy() ? *type.GetElementTy()
+                                     : *type.GetPointeeTy();
+-  size_t elem_size = elem_type.GetSize();
+ 
+   auto scoped_del_expr = accept(arr.expr);
+   Value *array = expr_;
+@@ -1889,7 +1889,7 @@ void CodegenLLVM::visit(ArrayAccess &arr)
+       array = b_.CreatePtrToInt(array, b_.getInt64Ty());
+ 
+     Value *index = b_.CreateIntCast(expr_, b_.getInt64Ty(), type.IsSigned());
+-    Value *offset = b_.CreateMul(index, b_.getInt64(elem_size));
++    Value *offset = b_.CreatePtrOffset(elem_type, index, type.GetAS());
+ 
+     probereadDatastructElem(array,
+                             offset,
+diff --git a/tests/runtime/array b/tests/runtime/array
+index d84150ea..c70586e5 100644
+--- a/tests/runtime/array
++++ b/tests/runtime/array
+@@ -142,3 +142,9 @@ RUN {{BPFTRACE}} -e 'struct A { int x[4]; } uprobe:./testprogs/array_access:test
+ EXPECT Result: 1
+ TIMEOUT 5
+ AFTER ./testprogs/array_access
++
++NAME array of pointers element access
++PROG struct C { int *z[4]; } uprobe:./testprogs/array_access:test_ptr_array { @x = *((struct C*)arg0)->z[1]; exit(); }
++EXPECT @x: 2
++TIMEOUT 5
++AFTER ./testprogs/array_access
+diff --git a/tests/runtime/pointers b/tests/runtime/pointers
+index a8213573..11dad673 100644
+--- a/tests/runtime/pointers
++++ b/tests/runtime/pointers
+@@ -92,3 +92,9 @@ NAME Pointer walk through struct
+ RUN {{BPFTRACE}} runtime/scripts/struct_walk.bt -c ./testprogs/struct_walk
+ EXPECT ^a: 45 b: 1000
+ TIMEOUT 5
++
++NAME Pointer to pointer arithmetic and dereference
++PROG uprobe:./testprogs/array_access:test_ptr_array { $p = (int32 **)arg0; @x = **($p + 1); exit(); }
++EXPECT @x: 2
++AFTER ./testprogs/array_access
++TIMEOUT 5
+diff --git a/tests/runtime/pointers.rej b/tests/runtime/pointers.rej
+new file mode 100644
+index 00000000..7efefca4
+--- /dev/null
++++ b/tests/runtime/pointers.rej
+@@ -0,0 +1,11 @@
++diff a/tests/runtime/pointers b/tests/runtime/pointers	(rejected hunks)
++@@ -98,3 +98,9 @@ PROG struct C { uint32_t a; }; uprobe:./testprogs/struct_walk:clear { $c = (stru
++ AFTER ./testprogs/struct_walk
++ EXPECT ^ptr: 0x[0-9a-z]+
++ TIMEOUT 5
+++
+++NAME Pointer to pointer arithmetic and dereference
+++PROG uprobe:./testprogs/array_access:test_ptr_array { $p = (int32 **)arg0; @x = **($p + 1); exit(); }
+++EXPECT @x: 2
+++AFTER ./testprogs/array_access
+++TIMEOUT 5
+diff --git a/tests/testprogs/array_access.c b/tests/testprogs/array_access.c
+index 570751ec..94241404 100644
+--- a/tests/testprogs/array_access.c
++++ b/tests/testprogs/array_access.c
+@@ -8,6 +8,11 @@ struct B
+   int y[2][2];
+ };
+ 
++struct C
++{
++  int *z[4];
++};
++
+ void test_array(int *a __attribute__((unused)))
+ {
+ }
+@@ -17,6 +22,10 @@ void test_struct(struct A *a __attribute__((unused)),
+ {
+ }
+ 
++void test_ptr_array(struct C *c __attribute__((unused)))
++{
++}
++
+ int main(int argc __attribute__((unused)), char ** argv __attribute__((unused)))
+ {
+   struct A a;
+@@ -32,4 +41,11 @@ int main(int argc __attribute__((unused)), char ** argv __attribute__((unused)))
+   b.y[1][1] = 8;
+   test_struct(&a, &b);
+   test_array(a.x);
++
++  struct C c;
++  c.z[0] = &a.x[0];
++  c.z[1] = &a.x[1];
++  c.z[2] = &a.x[2];
++  c.z[3] = &a.x[3];
++  test_ptr_array(&c);
+ }
